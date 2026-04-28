@@ -1,0 +1,238 @@
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  IMAGE_NAME: devsecops-demo
+  IMAGE_TAG: ${{ github.sha }}
+  TRIVY_SEVERITY_THRESHOLD: CRITICAL,HIGH
+
+jobs:
+ 
+  sast-sonarqube:
+    name: "🔍 SAST — SonarQube"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r app/requirements.txt
+          pip install pytest pytest-cov
+
+      - name: Run unit tests with coverage
+        run: |
+          pytest tests/ --cov=app --cov-report=xml:coverage.xml --cov-report=term-missing
+        continue-on-error: false
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=devsecops-demo
+            -Dsonar.sources=app
+            -Dsonar.tests=tests
+            -Dsonar.python.coverage.reportPaths=coverage.xml
+            -Dsonar.qualitygate.wait=true
+
+
+      - name: SonarQube Quality Gate Check
+        uses: SonarSource/sonarqube-quality-gate-action@master
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  
+  secret-scan:
+    name: "🔑 Secret Detection — Gitleaks"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        
+  dockerfile-lint:
+    name: "🐳 Dockerfile Lint — Hadolint"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Lint production Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: warning
+          format: sarif
+          output-file: hadolint-results.sarif
+
+      - name: Upload Hadolint SARIF results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: hadolint-results.sarif
+          category: hadolint
+
+      - name: Lint vulnerable Dockerfile (demo)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: docker/Dockerfile.vulnerable
+          failure-threshold: error
+          no-fail: true  
+        continue-on-error: true
+
+
+  build:
+    name: "🏗️ Build Docker Image"
+    runs-on: ubuntu-latest
+    needs: [dockerfile-lint, secret-scan]
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          outputs: type=docker,dest=/tmp/image.tar
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp/image.tar
+          retention-days: 1
+
+  trivy-scan:
+    name: "🛡️ Vulnerability Scan — Trivy"
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp
+
+      - name: Load Docker image
+        run: docker load --input /tmp/image.tar
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: "CRITICAL,HIGH,MEDIUM"
+          exit-code: "0" 
+
+      - name: Upload Trivy SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: "trivy-results.sarif"
+          category: trivy
+
+      - name: Trivy — Quality Gate (block on CRITICAL)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          format: "table"
+          severity: "CRITICAL"
+          exit-code: "1"  
+
+      - name: Generate full vulnerability report
+        uses: aquasecurity/trivy-action@master
+        if: always()
+        with:
+          image-ref: "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          format: "json"
+          output: "trivy-full-report.json"
+          severity: "CRITICAL,HIGH,MEDIUM,LOW"
+          exit-code: "0"
+
+      - name: Upload full Trivy report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-vulnerability-report
+          path: trivy-full-report.json
+
+  deploy:
+    name: "🚀 Deploy to Production"
+    runs-on: ubuntu-latest
+    needs: [sast-sonarqube, trivy-scan, secret-scan]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: production
+      url: https://your-app.example.com
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download verified image
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp
+
+      - name: Load Docker image
+        run: docker load --input /tmp/image.tar
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push verified image to registry
+        run: |
+          docker tag ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
+            ghcr.io/${{ github.repository }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          docker tag ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
+            ghcr.io/${{ github.repository }}/${{ env.IMAGE_NAME }}:latest
+          docker push ghcr.io/${{ github.repository }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          docker push ghcr.io/${{ github.repository }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Deploy notification
+        run: |
+          echo "✅ All security gates passed!"
+          echo "✅ Image ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} deployed successfully"
+          echo "✅ No CRITICAL vulnerabilities detected"
+          echo "✅ SonarQube Quality Gate passed"
+          echo "✅ No hardcoded secrets found"

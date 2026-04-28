@@ -1,0 +1,21 @@
+# Hadolint configuration
+# https://github.com/hadolint/hadolint
+
+failure-threshold: warning
+
+
+ignore:
+
+trustedRegistries:
+  - docker.io
+  - ghcr.io
+  - registry.gitlab.com
+
+override:
+  error:
+    - DL3002 
+    - DL3025  
+  warning:
+    - DL3008  
+    - DL3009 
+    - DL3015  

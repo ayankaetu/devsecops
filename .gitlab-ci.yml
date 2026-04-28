@@ -1,0 +1,196 @@
+
+image: docker:24.0.5
+
+variables:
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+  IMAGE_NAME: "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA"
+  IMAGE_LATEST: "$CI_REGISTRY_IMAGE:latest"
+  TRIVY_SEVERITY: "CRITICAL,HIGH"
+  SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+  GIT_DEPTH: "0"  
+stages:
+  - test
+  - lint
+  - build
+  - scan
+  - quality-gate
+  - deploy
+
+unit-tests:
+  stage: test
+  image: python:3.11-slim
+  script:
+    - pip install -r app/requirements.txt pytest pytest-cov
+    - pytest tests/ --cov=app --cov-report=xml:coverage.xml --cov-report=term-missing -v
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+    paths:
+      - coverage.xml
+    expire_in: 1 day
+  coverage: '/TOTAL.*\s+(\d+%)$/'
+
+
+sonarqube-sast:
+  stage: test
+  image:
+    name: sonarsource/sonar-scanner-cli:latest
+    entrypoint: [""]
+  needs: [unit-tests]
+  cache:
+    key: "${CI_JOB_NAME}"
+    paths:
+      - .sonar/cache
+  script:
+    - sonar-scanner
+        -Dsonar.projectKey=devsecops-demo
+        -Dsonar.sources=app
+        -Dsonar.tests=tests
+        -Dsonar.host.url=$SONAR_HOST_URL
+        -Dsonar.login=$SONAR_TOKEN
+        -Dsonar.python.coverage.reportPaths=coverage.xml
+        -Dsonar.qualitygate.wait=true
+  allow_failure: false 
+
+secret-detection:
+  stage: test
+  image: zricethezav/gitleaks:latest
+  entrypoint: [""]
+  script:
+    - gitleaks detect --source . --verbose --report-format sarif --report-path gitleaks-report.sarif
+  artifacts:
+    when: always
+    paths:
+      - gitleaks-report.sarif
+    expire_in: 1 week
+  allow_failure: false
+
+hadolint-production:
+  stage: lint
+  image: hadolint/hadolint:latest-debian
+  script:
+    - echo "=== Linting production Dockerfile ==="
+    - hadolint Dockerfile --format tty
+    - hadolint Dockerfile --format json > hadolint-results.json
+  artifacts:
+    when: always
+    paths:
+      - hadolint-results.json
+    expire_in: 1 week
+  allow_failure: false
+
+hadolint-vulnerable-demo:
+  stage: lint
+  image: hadolint/hadolint:latest-debian
+  script:
+    - echo "=== Linting VULNERABLE Dockerfile (demo — issues expected) ==="
+    - hadolint docker/Dockerfile.vulnerable --format tty || true
+    - echo "--- Vulnerable Dockerfile issues found above (expected for demo) ---"
+  allow_failure: true 
+
+build-image:
+  stage: build
+  services:
+    - docker:24.0.5-dind
+  needs: [hadolint-production, secret-detection]
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+  script:
+    - echo "Building Docker image..."
+    - docker build -t "$IMAGE_NAME" -t "$IMAGE_LATEST" .
+    - docker save "$IMAGE_NAME" | gzip > image.tar.gz
+    - echo "Image built successfully"
+  artifacts:
+    paths:
+      - image.tar.gz
+    expire_in: 1 day
+
+
+trivy-scan:
+  stage: scan
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  needs: [build-image]
+  before_script:
+    - apk add --no-cache docker-cli
+    - gunzip -c image.tar.gz | docker load
+  script:
+    - echo "=== Scanning for ALL vulnerabilities (report only) ==="
+    - trivy image
+        --format json
+        --output trivy-full-report.json
+        --severity CRITICAL,HIGH,MEDIUM,LOW
+        --exit-code 0
+        "$IMAGE_NAME"
+    - echo "=== Generating SARIF report ==="
+    - trivy image
+        --format sarif
+        --output trivy-results.sarif
+        --severity CRITICAL,HIGH,MEDIUM
+        --exit-code 0
+        "$IMAGE_NAME"
+    - echo "=== Summary table ==="
+    - trivy image
+        --format table
+        --severity CRITICAL,HIGH,MEDIUM
+        --exit-code 0
+        "$IMAGE_NAME"
+  artifacts:
+    when: always
+    paths:
+      - trivy-full-report.json
+      - trivy-results.sarif
+    expire_in: 1 week
+
+
+quality-gate-trivy:
+  stage: quality-gate
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  needs: [trivy-scan, build-image]
+  before_script:
+    - apk add --no-cache docker-cli
+    - gunzip -c image.tar.gz | docker load
+  script:
+    - echo "⛔ QUALITY GATE: Checking for CRITICAL vulnerabilities..."
+    - echo "Pipeline will FAIL if any CRITICAL CVE is found in the image."
+    - trivy image
+        --format table
+        --severity CRITICAL
+        --exit-code 1
+        "$IMAGE_NAME"
+    - echo "✅ Quality Gate PASSED — No CRITICAL vulnerabilities found!"
+  allow_failure: false 
+
+
+deploy-production:
+  stage: deploy
+  image: alpine:latest
+  needs: [quality-gate-trivy, sonarqube-sast]
+  only:
+    - main
+  before_script:
+    - apk add --no-cache docker-cli
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+    - gunzip -c image.tar.gz | docker load
+  script:
+    - echo "🚀 All security gates passed. Starting deployment..."
+    - docker push "$IMAGE_NAME"
+    - docker push "$IMAGE_LATEST"
+    - echo ""
+    - echo "╔══════════════════════════════════════╗"
+    - echo "║  ✅ DEPLOYMENT SUCCESSFUL            ║"
+    - echo "║  ✅ Trivy: No CRITICAL CVEs          ║"
+    - echo "║  ✅ SonarQube: Quality Gate passed   ║"
+    - echo "║  ✅ Gitleaks: No secrets detected    ║"
+    - echo "║  ✅ Hadolint: Dockerfile clean       ║"
+    - echo "╚══════════════════════════════════════╝"
+  environment:
+    name: production
+    url: https://your-app.example.com
+  when: on_success

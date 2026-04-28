@@ -1,0 +1,27 @@
+# Trivy configuration
+# https://aquasecurity.github.io/trivy/latest/docs/references/configuration/config-file/
+
+severity:
+  - CRITICAL
+  - HIGH
+  - MEDIUM
+
+exit-code: 1
+
+format: table
+
+cache:
+  dir: $HOME/.trivy-cache
+
+ignore-unfixed: false
+
+db:
+  no-progress: false
+
+vulnerability:
+  type:
+    - os       
+    - library  
+
+secret:
+  config: trivy-secret.yaml

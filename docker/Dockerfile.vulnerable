@@ -1,0 +1,16 @@
+
+FROM python:3.8
+
+COPY app/ /app
+
+WORKDIR /app
+
+RUN pip install -r requirements.txt
+
+ENV DB_PASSWORD="superSecretPassword123"
+ENV SECRET_KEY="hardcoded-secret-key-do-not-use"
+
+EXPOSE 22
+EXPOSE 5000
+
+CMD python app.py
